@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Adaptive Masker</title>
+<style>
+  body{margin:0;background:#0b0d10;color:#9aa4ad;font-family:sans-serif;padding:16px}
+  h1{font-size:18px;font-weight:600;margin:0 0 12px;color:#c9d1d9}
+  button{font-size:20px;padding:14px 28px;border:0;border-radius:10px;background:#2d6a4f;color:#fff;margin:8px 0 16px}
+  button.on{background:#9b2c2c}
+  .row{margin:14px 0}
+  .row label{display:flex;justify-content:space-between;font-size:14px}
+  .cap{font-size:12px;color:#6b7580;margin-top:2px}
+  input[type=range]{width:100%}
+  .bar{height:14px;background:#1a1f25;border-radius:7px;overflow:hidden;margin:4px 0 10px}
+  .bar div{height:100%;width:0;background:#3b82a0}
+  #vol{background:#2d6a4f}
+  #msg{font-size:13px;color:#d29922;min-height:18px}
+</style>
+</head>
+<body>
+<h1>Adaptive Masker</h1>
+<button id="go">Start</button>
+<div id="msg"></div>
+
+<div>Room noise <span id="nDb">--</span> dB</div>
+<div class="bar"><div id="nBar"></div></div>
+<div>Masking volume <span id="vPct">--</span>%</div>
+<div class="bar"><div id="vol"></div></div>
+
+<div class="row"><label>Trigger <span id="v_trig"></span></label>
+<input type="range" id="trig" min="-80" max="-20" step="1" value="-55">
+<div class="cap">Room noise level where volume starts rising</div></div>
+
+<div class="row"><label>Range <span id="v_range"></span></label>
+<input type="range" id="range" min="5" max="40" step="1" value="20">
+<div class="cap">dB above trigger to reach max volume</div></div>
+
+<div class="row"><label>Min volume <span id="v_min"></span></label>
+<input type="range" id="min" min="0" max="100" step="1" value="15"></div>
+
+<div class="row"><label>Max volume <span id="v_max"></span></label>
+<input type="range" id="max" min="0" max="100" step="1" value="60">
+<div class="cap">Hard ceiling, also stops feedback runaway</div></div>
+
+<div class="row"><label>Fade-down <span id="v_rel"></span></label>
+<input type="range" id="rel" min="2" max="60" step="1" value="20">
+<div class="cap">Seconds to settle after noise drops</div></div>
+
+<script>
+var ids=["trig","range","min","max","rel"],units={trig:" dB",range:" dB",min:"%",max:"%",rel:" s"};
+var S={};
+function load(){try{var j=JSON.parse(localStorage.getItem("masker")||"{}");ids.forEach(function(i){if(j[i]!=null)document.getElementById(i).value=j[i]})}catch(e){}}
+function sync(){ids.forEach(function(i){S[i]=+document.getElementById(i).value;document.getElementById("v_"+(i=="rel"?"rel":i)).textContent=S[i]+units[i]});
+  try{localStorage.setItem("masker",JSON.stringify(S))}catch(e){}}
+ids.forEach(function(i){document.getElementById(i).addEventListener("input",sync)});
+load();sync();
+
+var ctx,gain,analyser,buf,timer,stream,running=false,env=-90,wl=null;
+var $=function(i){return document.getElementById(i)};
+
+function makeBrown(ctx){
+  var sr=ctx.sampleRate,len=sr*30,fade=sr*2,n=len+fade,raw=new Float32Array(n),last=0;
+  for(var i=0;i<n;i++){var w=Math.random()*2-1;last=(last+0.02*w)/1.02;raw[i]=last*3.5}
+  var out=ctx.createBuffer(1,len,sr),d=out.getChannelData(0);
+  for(var j=0;j<len;j++)d[j]=raw[j];
+  for(var k=0;k<fade;k++){var t=k/fade;d[k]=raw[k]*t+raw[len+k]*(1-t)}
+  return out;
+}
+
+async function start(){
+  $("msg").textContent="";
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  }catch(e){$("msg").textContent="Mic blocked or unavailable: "+e.name;return}
+  var AC=window.AudioContext||window.webkitAudioContext;
+  ctx=new AC();if(ctx.resume)ctx.resume();
+  gain=ctx.createGain();gain.gain.value=0;gain.connect(ctx.destination);
+  var src=ctx.createBufferSource();src.buffer=makeBrown(ctx);src.loop=true;src.connect(gain);src.start();
+  var mic=ctx.createMediaStreamSource(stream);
+  analyser=ctx.createAnalyser();analyser.fftSize=2048;mic.connect(analyser);
+  buf=new Float32Array(analyser.fftSize);
+  env=-90;running=true;timer=setInterval(tick,100);
+  try{if(navigator.wakeLock)wl=await navigator.wakeLock.request("screen")}catch(e){}
+  $("go").textContent="Stop";$("go").className="on";
+}
+
+function stop(){
+  running=false;clearInterval(timer);
+  try{stream.getTracks().forEach(function(t){t.stop()})}catch(e){}
+  try{ctx.close()}catch(e){}
+  try{if(wl)wl.release()}catch(e){}
+  $("go").textContent="Start";$("go").className="";
+  $("nDb").textContent="--";$("vPct").textContent="--";$("nBar").style.width="0";$("vol").style.width="0";
+}
+
+function tick(){
+  analyser.getFloatTimeDomainData(buf);
+  var s=0;for(var i=0;i<buf.length;i++)s+=buf[i]*buf[i];
+  var db=20*Math.log10(Math.sqrt(s/buf.length)+1e-9);
+  if(db>env)env+=(db-env)*0.5;
+  else env+=(db-env)*Math.min(1,0.1/S.rel);
+  var norm=Math.max(0,Math.min(1,(env-S.trig)/S.range));
+  var lo=Math.min(S.min,S.max),hi=Math.max(S.min,S.max);
+  var vol=lo+(hi-lo)*norm;
+  var g=Math.pow(vol/100,2);
+  gain.gain.setTargetAtTime(g,ctx.currentTime,0.15);
+  $("nDb").textContent=env.toFixed(0);
+  $("vPct").textContent=vol.toFixed(0);
+  $("nBar").style.width=Math.max(0,Math.min(100,(env+90)/70*100))+"%";
+  $("vol").style.width=vol+"%";
+}
+
+$("go").addEventListener("click",function(){running?stop():start()});
+</script>
+</body>
+</html>
