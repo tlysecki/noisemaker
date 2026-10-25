@@ -17,6 +17,13 @@
   .bar div{height:100%;width:0;background:#3b82a0}
   #vol{background:#2d6a4f}
   #msg{font-size:13px;color:#d29922;min-height:18px}
+  #spec{display:flex;gap:6px;height:70px;align-items:flex-end;margin:4px 0 2px}
+  #spec .c{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+  #spec .p{display:flex;gap:2px;align-items:flex-end;height:calc(100% - 14px);width:100%}
+  #spec .p i{flex:1;display:block;height:4%;border-radius:2px 2px 0 0}
+  #spec .r{background:#3b82a0}
+  #spec .m{background:#2d6a4f}
+  #spec b{font-weight:400;font-size:10px;color:#6b7580;height:14px;line-height:14px}
 </style>
 </head>
 <body>
@@ -28,6 +35,8 @@
 <div class="bar"><div id="nBar"></div></div>
 <div>Masking volume <span id="vPct">--</span>%</div>
 <div class="bar"><div id="vol"></div></div>
+<div id="spec"></div>
+<div class="cap">Tone by band (Hz): blue = room, green = masker</div>
 
 <div class="row"><label>Trigger <span id="v_trig"></span></label>
 <input type="range" id="trig" min="-80" max="-20" step="1" value="-55">
@@ -48,8 +57,12 @@
 <input type="range" id="rel" min="2" max="60" step="1" value="20">
 <div class="cap">Seconds to settle after noise drops</div></div>
 
+<div class="row"><label>Follow room <span id="v_follow"></span></label>
+<input type="range" id="follow" min="0" max="100" step="1" value="70">
+<div class="cap">0 = fixed brown tone, 100 = copy the room's tone</div></div>
+
 <script>
-var ids=["trig","range","min","max","rel"],units={trig:" dB",range:" dB",min:"%",max:"%",rel:" s"};
+var ids=["trig","range","min","max","rel","follow"],units={trig:" dB",range:" dB",min:"%",max:"%",rel:" s",follow:"%"};
 var S={};
 function load(){try{var j=JSON.parse(localStorage.getItem("masker")||"{}");ids.forEach(function(i){if(j[i]!=null)document.getElementById(i).value=j[i]})}catch(e){}}
 function sync(){ids.forEach(function(i){S[i]=+document.getElementById(i).value;document.getElementById("v_"+(i=="rel"?"rel":i)).textContent=S[i]+units[i]});
@@ -58,15 +71,68 @@ ids.forEach(function(i){document.getElementById(i).addEventListener("input",sync
 load();sync();
 
 var ctx,gain,analyser,buf,timer,stream,running=false,env=-90,wl=null;
+var fbuf,sm=null,bands=[],MK=1;
 var $=function(i){return document.getElementById(i)};
 
-function makeBrown(ctx){
-  var sr=ctx.sampleRate,len=sr*30,fade=sr*2,n=len+fade,raw=new Float32Array(n),last=0;
-  for(var i=0;i<n;i++){var w=Math.random()*2-1;last=(last+0.02*w)/1.02;raw[i]=last*3.5}
-  var out=ctx.createBuffer(1,len,sr),d=out.getChannelData(0);
-  for(var j=0;j<len;j++)d[j]=raw[j];
-  for(var k=0;k<fade;k++){var t=k/fade;d[k]=raw[k]*t+raw[len+k]*(1-t)}
+var FC=[63,125,250,500,1000,2000,4000,8000],LB=["63","125","250","500","1k","2k","4k","8k"],Q=1.41,NB=FC.length;
+
+(function(){var h="";for(var i=0;i<NB;i++)h+='<div class="c"><div class="p"><i class="r"></i><i class="m"></i></div><b>'+LB[i]+'</b></div>';$("spec").innerHTML=h})();
+
+function makeWhite(ctx){
+  var sr=ctx.sampleRate,out=ctx.createBuffer(1,sr*10,sr),d=out.getChannelData(0);
+  for(var i=0;i<d.length;i++)d[i]=Math.random()*2-1;
   return out;
+}
+
+// Room band levels (dB, octave-band power) from the mic's spectrum
+function bandLevels(){
+  analyser.getFloatFrequencyData(fbuf);
+  var hz=ctx.sampleRate/analyser.fftSize,out=[];
+  for(var i=0;i<NB;i++){
+    var a=Math.max(1,Math.round(FC[i]/Math.SQRT2/hz)),z=Math.min(fbuf.length-1,Math.round(FC[i]*Math.SQRT2/hz)),p=0;
+    for(var k=a;k<=z;k++)p+=Math.pow(10,fbuf[k]/10);
+    out[i]=10*Math.log10(p+1e-14);
+  }
+  return out;
+}
+
+// SHAPE-START
+// Blend a fixed brown tilt (-3 dB per octave band) toward the room's own band shape.
+// Returns target band levels T (dB, relative) and per-band filter gains g (total power fixed).
+function shapeFor(room,follow){
+  var n=FC.length,mean=0,i;
+  for(i=0;i<n;i++)mean+=room[i];mean/=n;
+  var base=[],bm=0;
+  for(i=0;i<n;i++){base[i]=-3*i;bm+=base[i]}bm/=n;
+  var T=[],tot=0;
+  for(i=0;i<n;i++){
+    var b=base[i]-bm,s=room[i]-mean;
+    var d=Math.max(-15,Math.min(15,follow*(s-b)));
+    T[i]=b+d;tot+=Math.pow(10,T[i]/10);
+  }
+  var g=[],k=1/Math.sqrt(tot);
+  for(i=0;i<n;i++){
+    var W=10*Math.log10(FC[i]/FC[0]);
+    g[i]=Math.pow(10,(T[i]-W)/20)*k;
+  }
+  return {T:T,g:g};
+}
+// SHAPE-END
+
+function adapt(norm){
+  var lv=bandLevels(),i,mean=0;
+  if(!sm)sm=lv.slice();
+  var rel=Math.min(1,0.1/S.rel);
+  for(i=0;i<NB;i++){sm[i]+=(lv[i]-sm[i])*(lv[i]>sm[i]?0.4:rel);mean+=sm[i]}
+  mean/=NB;
+  var follow=(S.follow/100)*Math.min(1,norm*2);
+  var sh=shapeFor(sm,follow),cols=$("spec").children,t=ctx.currentTime;
+  for(i=0;i<NB;i++){
+    bands[i].gain.setTargetAtTime(sh.g[i]*MK,t,0.3);
+    var p=cols[i].firstChild.children;
+    p[0].style.height=Math.max(4,Math.min(100,(sm[i]-mean+25)/40*100))+"%";
+    p[1].style.height=Math.max(4,Math.min(100,(sh.T[i]+25)/40*100))+"%";
+  }
 }
 
 async function start(){
@@ -77,10 +143,20 @@ async function start(){
   var AC=window.AudioContext||window.webkitAudioContext;
   ctx=new AC();if(ctx.resume)ctx.resume();
   gain=ctx.createGain();gain.gain.value=0;gain.connect(ctx.destination);
-  var src=ctx.createBufferSource();src.buffer=makeBrown(ctx);src.loop=true;src.connect(gain);src.start();
+  var src=ctx.createBufferSource();src.buffer=makeWhite(ctx);src.loop=true;
+  bands=[];
+  FC.forEach(function(fc){
+    var f=ctx.createBiquadFilter();f.type="bandpass";f.frequency.value=fc;f.Q.value=Q;
+    var g=ctx.createGain();g.gain.value=0;
+    src.connect(f);f.connect(g);g.connect(gain);bands.push(g);
+  });
+  // makeup so the total masker level is about the same as the old fixed brown noise (rms ~0.2)
+  MK=0.2/Math.sqrt((1/3)/(ctx.sampleRate/2)*(Math.PI/2)/Q*FC[0]);
+  src.start();
   var mic=ctx.createMediaStreamSource(stream);
-  analyser=ctx.createAnalyser();analyser.fftSize=2048;mic.connect(analyser);
+  analyser=ctx.createAnalyser();analyser.fftSize=4096;analyser.smoothingTimeConstant=0.5;mic.connect(analyser);
   buf=new Float32Array(analyser.fftSize);
+  fbuf=new Float32Array(analyser.frequencyBinCount);sm=null;
   env=-90;running=true;timer=setInterval(tick,100);
   try{if(navigator.wakeLock)wl=await navigator.wakeLock.request("screen")}catch(e){}
   $("go").textContent="Stop";$("go").className="on";
@@ -110,6 +186,7 @@ function tick(){
   $("vPct").textContent=vol.toFixed(0);
   $("nBar").style.width=Math.max(0,Math.min(100,(env+90)/70*100))+"%";
   $("vol").style.width=vol+"%";
+  adapt(norm);
 }
 
 $("go").addEventListener("click",function(){running?stop():start()});
